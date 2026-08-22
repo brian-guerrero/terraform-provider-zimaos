@@ -8,12 +8,16 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
-	"github.com/example/terraform-provider-zimaos/internal/client"
+	"github.com/brian-guerrero/terraform-provider-zimaos/internal/client"
 )
 
-// providerData carries the configured client to resources/datasources in this package.
-type providerData struct {
-	client *client.Client
+// ProviderData carries the configured client to resources/datasources. It is
+// exported so the root provider package (terraformproviderzimaos) can construct
+// it and set it as ResourceData/DataSourceData; resources/datasources in this
+// package type-assert it back. Keeping a single shared type avoids the
+// "expected *providerData, got *terraformproviderzimaos.providerData" mismatch.
+type ProviderData struct {
+	Client *client.Client
 }
 
 // --- zimaos_app data source (read-only lookup by name) ---
@@ -40,12 +44,12 @@ func (d *appDataSource) Configure(_ context.Context, req datasource.ConfigureReq
 	if req.ProviderData == nil {
 		return
 	}
-	pd, ok := req.ProviderData.(*providerData)
+	pd, ok := req.ProviderData.(*ProviderData)
 	if !ok {
-		resp.Diagnostics.AddError("Unexpected provider data", fmt.Sprintf("expected *providerData, got %T", req.ProviderData))
+		resp.Diagnostics.AddError("Unexpected provider data", fmt.Sprintf("expected *ProviderData, got %T", req.ProviderData))
 		return
 	}
-	d.client = pd.client
+	d.client = pd.Client
 }
 
 func (d *appDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
@@ -97,12 +101,12 @@ func (d *systemInfoDataSource) Configure(_ context.Context, req datasource.Confi
 	if req.ProviderData == nil {
 		return
 	}
-	pd, ok := req.ProviderData.(*providerData)
+	pd, ok := req.ProviderData.(*ProviderData)
 	if !ok {
-		resp.Diagnostics.AddError("Unexpected provider data", fmt.Sprintf("expected *providerData, got %T", req.ProviderData))
+		resp.Diagnostics.AddError("Unexpected provider data", fmt.Sprintf("expected *ProviderData, got %T", req.ProviderData))
 		return
 	}
-	d.client = pd.client
+	d.client = pd.Client
 }
 
 func (d *systemInfoDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {

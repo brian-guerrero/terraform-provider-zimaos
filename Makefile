@@ -1,7 +1,7 @@
 .PHONY: build test vet lint install acctest
 
 build:
-	go build -o terraform-provider-zimaos.exe .
+	go build -o terraform-provider-zimaos.exe ./zimaos
 
 test:
 	go test ./...

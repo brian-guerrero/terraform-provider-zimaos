@@ -1,0 +1,62 @@
+name: CI
+
+# Runs on every push to main/develop and on pull requests, plus manual dispatch.
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  test:
+    name: build / vet / unit / acceptance
+    runs-on: ubuntu-latest
+    # Acceptance harness symlinks the module into a temp work dir; only works on
+    # POSIX filesystems, hence ubuntu-latest (not Windows). On Windows the
+    # harness fails without Developer Mode; the white-box lifecycle test in
+    # internal/provider already covers that logic without the harness.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: latest
+          tofu_wrapper: false
+          # Drives the acceptance harness with OpenTofu instead of Terraform CLI.
+          # Exports TF_ACC, TF_ACC_TERRAFORM_PATH (and registry namespace/host,
+          # which are unused because we supply an in-process provider factory).
+          provider_acceptance_tests: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # Unit + white-box lifecycle tests (no live device needed, no symlinks).
+      - name: Unit tests
+        run: go test ./... -count=1
+
+      # Acceptance tests (TF_ACC=1 is exported by setup-opentofu). Driven by the
+      # in-process spec mock unless a live box is supplied via ZIMAOS_HOST /
+      # ZIMAOS_TOKEN secrets.
+      - name: Acceptance tests
+        env:
+          ZIMAOS_HOST: ${{ secrets.ZIMAOS_HOST }}
+          ZIMAOS_TOKEN: ${{ secrets.ZIMAOS_TOKEN }}
+        run: go test ./... -count=1 -v -run 'TestAcc'

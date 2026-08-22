@@ -9,10 +9,12 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
-	"github.com/example/terraform-provider-zimaos/internal/client"
+	"github.com/brian-guerrero/terraform-provider-zimaos/internal/client"
 )
 
 var (
@@ -48,12 +50,12 @@ func (r *appResource) Configure(_ context.Context, req resource.ConfigureRequest
 	if req.ProviderData == nil {
 		return
 	}
-	pd, ok := req.ProviderData.(*providerData)
+	pd, ok := req.ProviderData.(*ProviderData)
 	if !ok {
-		resp.Diagnostics.AddError("Unexpected provider data", fmt.Sprintf("expected *providerData, got %T", req.ProviderData))
+		resp.Diagnostics.AddError("Unexpected provider data", fmt.Sprintf("expected *ProviderData, got %T", req.ProviderData))
 		return
 	}
-	r.client = pd.client
+	r.client = pd.Client
 }
 
 func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
@@ -94,8 +96,9 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"desired_state": schema.StringAttribute{
 				Optional:    true,
 				Computed:    true,
-				Default:     nil, // set below via planmodifier would be cleaner; kept simple
-				Description: "start / stop / restart; drives PUT /compose/{id}/status.",
+				Default:     stringdefault.StaticString("start"),
+				Description: "start / stop / restart; drives PUT /compose/{id}/status. Defaults to start.",
+				Validators:  []validator.String{oneOfStatusValidator{}},
 			},
 			"status": schema.StringAttribute{
 				Computed:    true,
@@ -129,7 +132,6 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 		return
 	}
 
-	plan.ID = types.StringValue(plan.Name.ValueString())
 	if plan.DesiredState.IsNull() || plan.DesiredState.ValueString() == "" {
 		plan.DesiredState = types.StringValue("start")
 	}
@@ -138,6 +140,16 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 		return
 	}
 
+	// Read back live status so computed fields are populated immediately.
+	app, err := r.client.GetCompose(ctx, plan.Name.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Error reading app after create", err.Error())
+		return
+	}
+	// The compose project name is the stable identifier and the required id.
+	plan.ID = types.StringValue(plan.Name.ValueString())
+	plan.Status = types.StringValue(app.Status)
+	plan.UpdateAvailable = types.BoolValue(app.UpdateAvailable)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -152,8 +164,24 @@ func (r *appResource) Read(ctx context.Context, req resource.ReadRequest, resp *
 		resp.Diagnostics.AddError("Error reading app", err.Error())
 		return
 	}
+	// The compose project name is the stable identifier. Set it as id so import
+	// (which only supplies name via passthrough) yields a complete state.
+	if state.Name.ValueString() != "" {
+		state.ID = types.StringValue(state.Name.ValueString())
+	}
 	state.Status = types.StringValue(app.Status)
 	state.UpdateAvailable = types.BoolValue(app.UpdateAvailable)
+	// Populate compose_yaml from the API's own compose object where available
+	// (needed so import — and `tofu plan -generate-config-out` — produce a
+	// usable, non-null value for this Required attribute). This is the API's
+	// normalized view, not necessarily byte-identical to what a user hand-authored,
+	// so expect a one-time diff on the next plan after adopting an existing app
+	// this way — see ComposeYAML() doc comment.
+	if cy, err := app.ComposeYAML(); err != nil {
+		resp.Diagnostics.AddWarning("Could not re-derive compose_yaml from API", err.Error())
+	} else if cy != "" {
+		state.ComposeYAML = types.StringValue(cy)
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -163,7 +191,7 @@ func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, re
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	if _, err := r.client.InstallCompose(ctx, plan.ComposeYAML.ValueString(), false, plan.CheckPortConflict.ValueBool()); err != nil {
+	if err := r.client.UpdateCompose(ctx, plan.Name.ValueString(), plan.ComposeYAML.ValueString(), false, plan.CheckPortConflict.ValueBool()); err != nil {
 		resp.Diagnostics.AddError("Error updating app", err.Error())
 		return
 	}
@@ -173,6 +201,16 @@ func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, re
 			return
 		}
 	}
+	app, err := r.client.GetCompose(ctx, plan.Name.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Error reading app after update", err.Error())
+		return
+	}
+	// Keep the identifier stable across update (name is RequiresReplace, so it
+	// cannot change here, but the framework requires id in the apply result).
+	plan.ID = types.StringValue(plan.Name.ValueString())
+	plan.Status = types.StringValue(app.Status)
+	plan.UpdateAvailable = types.BoolValue(app.UpdateAvailable)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 

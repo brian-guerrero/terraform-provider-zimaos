@@ -9,18 +9,14 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
-	"github.com/example/terraform-provider-zimaos/internal/client"
-	providerinternal "github.com/example/terraform-provider-zimaos/internal/provider"
+	"github.com/brian-guerrero/terraform-provider-zimaos/internal/client"
+	providerinternal "github.com/brian-guerrero/terraform-provider-zimaos/internal/provider"
 )
 
 // Ensure the provider satisfies the framework interfaces.
 var _ provider.Provider = (*zimaOSProvider)(nil)
 
 type zimaOSProvider struct{}
-
-type providerData struct {
-	client *client.Client
-}
 
 func New() func() provider.Provider {
 	return func() provider.Provider { return &zimaOSProvider{} }
@@ -39,9 +35,19 @@ func (p *zimaOSProvider) Schema(_ context.Context, _ provider.SchemaRequest, res
 				Description: "Base URL of the ZimaOS device API, e.g. http://192.168.1.50:8080",
 			},
 			"token": schema.StringAttribute{
-				Required:    true,
+				Optional:    true,
 				Sensitive:   true,
-				Description: "API token sent as the Authorization header (confirmed auth scheme).",
+				Description: "API access token sent as a bare 'Authorization' header (no 'Bearer ' prefix — confirmed against a live device, see internal/client/client.go). Optional: if omitted, username+password are exchanged for a token via POST /login (tokens are short-lived, so this is the preferred way to avoid stale tokens).",
+			},
+			"username": schema.StringAttribute{
+				Optional:    true,
+				Sensitive:   true,
+				Description: "ZimaOS username. Used with password to obtain a token via POST /login when token is not set.",
+			},
+			"password": schema.StringAttribute{
+				Optional:    true,
+				Sensitive:   true,
+				Description: "ZimaOS password. Used with username to obtain a token via POST /login when token is not set.",
 			},
 		},
 	}
@@ -55,8 +61,21 @@ func (p *zimaOSProvider) Configure(ctx context.Context, req provider.ConfigureRe
 	}
 
 	c := client.New(cfg.Host.ValueString(), cfg.Token.ValueString())
-	resp.ResourceData = &providerData{client: c}
-	resp.DataSourceData = &providerData{client: c}
+
+	// If no token was supplied, exchange username+password for one (ZimaOS
+	// POST /login -> { data: { token: { access_token, refresh_token } } }).
+	// Tokens are short-lived, so this is the preferred path over a pasted token.
+	if cfg.Token.IsNull() && !cfg.Username.IsNull() && !cfg.Password.IsNull() {
+		ts, err := c.Login(ctx, cfg.Username.ValueString(), cfg.Password.ValueString())
+		if err != nil {
+			resp.Diagnostics.AddError("ZimaOS login failed", err.Error())
+			return
+		}
+		c.SetToken(ts.AccessToken)
+	}
+
+	resp.ResourceData = &providerinternal.ProviderData{Client: c}
+	resp.DataSourceData = &providerinternal.ProviderData{Client: c}
 }
 
 func (p *zimaOSProvider) Resources(_ context.Context) []func() resource.Resource {
@@ -73,6 +92,8 @@ func (p *zimaOSProvider) DataSources(_ context.Context) []func() datasource.Data
 }
 
 type providerSchemaModel struct {
-	Host  types.String `tfsdk:"host"`
-	Token types.String `tfsdk:"token"`
+	Host     types.String `tfsdk:"host"`
+	Token    types.String `tfsdk:"token"`
+	Username types.String `tfsdk:"username"`
+	Password types.String `tfsdk:"password"`
 }

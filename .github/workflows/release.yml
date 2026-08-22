@@ -1,0 +1,49 @@
+name: release
+
+# Fires on a semver tag push (v0.1.0, v1.2.3, ...). Builds, signs, and
+# publishes cross-platform binaries via GoReleaser; the Terraform/OpenTofu
+# registries ingest new versions from the resulting GitHub Release once the
+# provider is registered there (see docs/ + README for the one-time setup).
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # Registry-signed releases require a GPG key registered with your
+      # registry.terraform.io account. Add the private key + passphrase as
+      # repo secrets GPG_PRIVATE_KEY / PASSPHRASE before tagging a release.
+      - name: Import GPG key
+        uses: crazy-max/ghaction-import-gpg@v6
+        id: import_gpg
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PASSPHRASE }}
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          args: release --clean
+        env:
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

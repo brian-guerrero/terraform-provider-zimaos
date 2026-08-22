@@ -1,6 +1,7 @@
 # Binaries
 terraform-provider-zimaos
 terraform-provider-zimaos.exe
+dist/
 
 # Terraform working dirs
 .terraform/
@@ -11,3 +12,7 @@ terraform-provider-zimaos.exe
 # Editor
 .idea/
 .vscode/
+
+# Local manual-test scratch (real host/creds)
+testing/import/terraform.tfvars
+testing/**/*.auto.tfvars

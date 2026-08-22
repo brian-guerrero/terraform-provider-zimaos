@@ -31,13 +31,13 @@ func specMock(t *testing.T) *httptest.Server {
 	mux := http.NewServeMux()
 	ok := func(w http.ResponseWriter) { w.Header().Set("Content-Type", "application/json") }
 
-	mux.HandleFunc("/compose", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v2/app_management/compose", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		if ct := r.Header.Get("Content-Type"); ct != "application/yaml" {
-			t.Errorf("POST /compose content-type = %q, want application/yaml", ct)
+			t.Errorf("POST /v2/app_management/compose content-type = %q, want application/yaml", ct)
 		}
 		b, _ := io.ReadAll(r.Body)
 		apps[composeName(string(b))] = string(b)
@@ -45,8 +45,8 @@ func specMock(t *testing.T) *httptest.Server {
 		_, _ = w.Write([]byte(`{}`))
 	})
 
-	mux.HandleFunc("/compose/", func(w http.ResponseWriter, r *http.Request) {
-		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/compose/"), "/status")
+	mux.HandleFunc("/v2/app_management/compose/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/app_management/compose/"), "/status")
 		switch r.Method {
 		case http.MethodGet:
 			if _, ok2 := apps[id]; !ok2 {
@@ -74,7 +74,7 @@ func specMock(t *testing.T) *httptest.Server {
 		}
 	})
 
-	mux.HandleFunc("/info", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v2/app_management/info", func(w http.ResponseWriter, r *http.Request) {
 		ok(w)
 		_, _ = w.Write([]byte(`{"architecture":"amd64"}`))
 	})

@@ -1,0 +1,13 @@
+# Binaries
+terraform-provider-zimaos
+terraform-provider-zimaos.exe
+
+# Terraform working dirs
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+
+# Editor
+.idea/
+.vscode/

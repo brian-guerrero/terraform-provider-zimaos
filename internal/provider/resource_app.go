@@ -2,7 +2,10 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -22,8 +25,27 @@ var (
 	_ resource.ResourceWithImportState = (*appResource)(nil)
 )
 
+// Default polling parameters for waitForAppRegistered. POST .../compose
+// (non-dry-run) returns as soon as the API *accepts* the request — CONFIRMED
+// against a live ZimaOS device (2026-08-24): the actual `docker compose pull
+// && up` runs in the background and a large image pull (observed: several
+// minutes for kestra/kestra:latest) can take a while, during which the app
+// isn't registered yet and GetCompose 404s "app not found". 3s keeps the
+// common case (small/cached images) snappy; 5m gives large pulls real headroom.
+const (
+	defaultAppPollInterval = 3 * time.Second
+	defaultAppPollTimeout  = 5 * time.Minute
+)
+
 type appResource struct {
 	client *client.Client
+
+	// pollInterval/pollTimeout drive waitForAppRegistered. Left zero-valued in
+	// normal construction (NewAppResource fills in the real defaults above);
+	// tests can shrink them via a lower-visibility constructor seam so async
+	// registration can be simulated without slowing the suite down.
+	pollInterval time.Duration
+	pollTimeout  time.Duration
 }
 
 type appResourceModel struct {
@@ -39,7 +61,10 @@ type appResourceModel struct {
 }
 
 func NewAppResource() resource.Resource {
-	return &appResource{}
+	return &appResource{
+		pollInterval: defaultAppPollInterval,
+		pollTimeout:  defaultAppPollTimeout,
+	}
 }
 
 func (r *appResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -132,6 +157,36 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 		return
 	}
 
+	// The install call above only confirms the API *accepted* the request —
+	// the app isn't necessarily registered yet (see waitForAppRegistered doc
+	// comment). Wait for it before touching status/reading it back, otherwise
+	// SetComposeStatus/GetCompose race the background install and 404.
+	if _, err := r.waitForAppRegistered(ctx, plan.Name.ValueString()); err != nil {
+		// InstallCompose already succeeded, so something is (or will be)
+		// running on the device even though we couldn't confirm it in time.
+		// Persist what we safely can — id plus the plan's own values — so
+		// this isn't an untracked orphan the user has to `tofu import` back
+		// in; a later plan/apply/refresh can reconcile it. Status/
+		// update_available are left null (unknown values are not valid in
+		// state) since we don't actually know them yet.
+		plan.ID = types.StringValue(plan.Name.ValueString())
+		plan.Status = types.StringNull()
+		plan.UpdateAvailable = types.BoolNull()
+		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+		resp.Diagnostics.AddError(
+			"Timed out confirming app installation",
+			fmt.Sprintf(
+				"The install request for app %q was accepted by the API, but the provider could not confirm "+
+					"it was fully registered before giving up: %s\n\n"+
+					"The app may still be installing in the background (large image pulls can take several "+
+					"minutes). Re-run `plan`/`apply` shortly, or `refresh`, to pick up its state once installation "+
+					"finishes. If the underlying error above looks persistent (auth, network, etc.), address that first.",
+				plan.Name.ValueString(), err,
+			),
+		)
+		return
+	}
+
 	if plan.DesiredState.IsNull() || plan.DesiredState.ValueString() == "" {
 		plan.DesiredState = types.StringValue("start")
 	}
@@ -151,6 +206,56 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 	plan.Status = types.StringValue(app.Status)
 	plan.UpdateAvailable = types.BoolValue(app.UpdateAvailable)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+}
+
+// waitForAppRegistered polls GetCompose until the app shows up (fast path:
+// one call, no delay, if it's already registered), a fatal error occurs, or
+// pollTimeout elapses.
+//
+// A 404 (*client.APIError with StatusCode 404) means "the install hasn't
+// registered the app yet" and is retried. Any other error (auth failure,
+// 5xx, network error, ctx cancellation, ...) is treated as fatal and
+// returned immediately — polling blindly on a real error for the full
+// timeout would just be bad UX.
+func (r *appResource) waitForAppRegistered(ctx context.Context, name string) (*client.ComposeApp, error) {
+	interval := r.pollInterval
+	if interval <= 0 {
+		interval = defaultAppPollInterval
+	}
+	timeout := r.pollTimeout
+	if timeout <= 0 {
+		timeout = defaultAppPollTimeout
+	}
+
+	pollCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var lastErr error
+	for {
+		app, err := r.client.GetCompose(ctx, name)
+		if err == nil {
+			return app, nil
+		}
+
+		var apiErr *client.APIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+			return nil, err
+		}
+		lastErr = err
+
+		timer := time.NewTimer(interval)
+		select {
+		case <-pollCtx.Done():
+			timer.Stop()
+			if !errors.Is(pollCtx.Err(), context.DeadlineExceeded) {
+				// pollCtx.Done() fired for a reason other than our own
+				// timeout elapsing — i.e. the caller's ctx was cancelled.
+				return nil, fmt.Errorf("context cancelled while waiting for app %q to be registered: %w", name, ctx.Err())
+			}
+			return nil, fmt.Errorf("timed out after %s waiting for app %q to be registered: %w", timeout, name, lastErr)
+		case <-timer.C:
+		}
+	}
 }
 
 func (r *appResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {

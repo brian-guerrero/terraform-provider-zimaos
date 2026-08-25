@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
@@ -80,6 +82,95 @@ func newAppResourceWithClient(c *client.Client) *appResource {
 	resp := &resource.ConfigureResponse{}
 	r.Configure(context.Background(), resource.ConfigureRequest{ProviderData: &pd}, resp)
 	return r
+}
+
+// newAppResourceWithPoll is like newAppResourceWithClient but overrides the
+// waitForAppRegistered poll interval/timeout, so async-registration tests
+// don't have to wait out the real (3s / 5m) defaults.
+func newAppResourceWithPoll(c *client.Client, interval, timeout time.Duration) *appResource {
+	r := newAppResourceWithClient(c)
+	r.pollInterval = interval
+	r.pollTimeout = timeout
+	return r
+}
+
+// appMockDelayedRegistration emulates the confirmed async-install race:
+// POST .../compose is accepted immediately, but GET .../compose/{id} 404s
+// "app not found" for the first notFoundCount calls before the app becomes
+// queryable — reproducing the real-world gap where `docker compose pull &&
+// up` finishes well after the install POST returns.
+func appMockDelayedRegistration(t *testing.T, notFoundCount int) *client.Client {
+	t.Helper()
+	var mu sync.Mutex
+	getCalls := 0
+	mux := http.NewServeMux()
+	ok := func(w http.ResponseWriter) { w.Header().Set("Content-Type", "application/json") }
+
+	mux.HandleFunc("/v2/app_management/compose", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		ok(w)
+		_, _ = w.Write([]byte(`{}`))
+		// Deliberately does NOT register the app here, simulating the
+		// background install gap.
+	})
+	mux.HandleFunc("/v2/app_management/compose/", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			if r.Method != http.MethodPut {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			_, _ = io.ReadAll(r.Body)
+			ok(w)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodGet:
+			mu.Lock()
+			getCalls++
+			calls := getCalls
+			mu.Unlock()
+			if calls <= notFoundCount {
+				http.Error(w, `{"message":"app not found"}`, http.StatusNotFound)
+				return
+			}
+			ok(w)
+			_, _ = w.Write([]byte(`{"data":{"status":"running","update_available":false,"compose":{"name":"hello","services":{"web":{"image":"nginx:latest"}}}}}`))
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return client.New(srv.URL, "test-token")
+}
+
+// appMockFatalPollError emulates install succeeding (POST accepted) but every
+// subsequent GET failing with a non-404 (fatal) error, so waitForAppRegistered
+// must give up immediately instead of retrying it out for the full timeout.
+func appMockFatalPollError(t *testing.T) *client.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	ok := func(w http.ResponseWriter) { w.Header().Set("Content-Type", "application/json") }
+
+	mux.HandleFunc("/v2/app_management/compose", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		ok(w)
+		_, _ = w.Write([]byte(`{}`))
+	})
+	mux.HandleFunc("/v2/app_management/compose/", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			_, _ = io.ReadAll(r.Body)
+			ok(w)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodGet:
+			http.Error(w, `{"message":"internal error"}`, http.StatusInternalServerError)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return client.New(srv.URL, "test-token")
 }
 
 func appSchema(t *testing.T) resource.SchemaResponse {
@@ -272,5 +363,117 @@ func TestAppResource_import(t *testing.T) {
 	// error, not just an empty value).
 	if importedFull.ComposeYAML.IsNull() || !strings.Contains(importedFull.ComposeYAML.ValueString(), "nginx:latest") {
 		t.Errorf("imported compose_yaml = %q, want it derived from the API's compose object", importedFull.ComposeYAML.ValueString())
+	}
+}
+
+func appCreateModel() appResourceModel {
+	return appResourceModel{
+		Name:                  types.StringValue("hello"),
+		ComposeYAML:           types.StringValue("name: hello\nservices:\n  web:\n    image: nginx:latest\n"),
+		DesiredState:          types.StringValue("start"),
+		DryRunOnPlan:          types.BoolValue(false),
+		CheckPortConflict:     types.BoolValue(true),
+		RetainConfigOnDestroy: types.BoolValue(false),
+	}
+}
+
+// Fast path: the app is queryable immediately after install (no async
+// registration gap). Create must not incur any poll delay.
+func TestAppResource_Create_FastPath_NoPollDelay(t *testing.T) {
+	c := appMock(t)
+	r := newAppResourceWithClient(c)
+	sch := appSchema(t)
+	ctx := context.Background()
+	model := appCreateModel()
+
+	start := time.Now()
+	createResp := &resource.CreateResponse{State: buildState(t, sch, model)}
+	r.Create(ctx, resource.CreateRequest{Config: buildConfig(t, sch, model), Plan: buildPlan(t, sch, model)}, createResp)
+	elapsed := time.Since(start)
+
+	if createResp.Diagnostics.HasError() {
+		t.Fatalf("Create error: %v", createResp.Diagnostics)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("Create took %s, want the fast path (app registered immediately, no poll delay)", elapsed)
+	}
+
+	var created appResourceModel
+	if diags := createResp.State.Get(ctx, &created); diags.HasError() {
+		t.Fatalf("created state get: %v", diags)
+	}
+	if created.Status.ValueString() != "running" {
+		t.Errorf("status = %q, want running", created.Status.ValueString())
+	}
+	if created.ID.ValueString() != "hello" {
+		t.Errorf("id = %q, want hello", created.ID.ValueString())
+	}
+}
+
+// Reproduces the confirmed real-world race: install is accepted, but the app
+// only becomes queryable a few GetCompose calls later (simulating the
+// background `docker compose pull && up`). Create must poll through the 404s
+// and succeed once the app is registered, instead of erroring out on the
+// first 404 the way the old code did.
+func TestAppResource_Create_WaitsForDelayedRegistration(t *testing.T) {
+	c := appMockDelayedRegistration(t, 3) // 404s on the first 3 GetCompose calls
+	r := newAppResourceWithPoll(c, 10*time.Millisecond, 2*time.Second)
+	sch := appSchema(t)
+	ctx := context.Background()
+	model := appCreateModel()
+
+	createResp := &resource.CreateResponse{State: buildState(t, sch, model)}
+	r.Create(ctx, resource.CreateRequest{Config: buildConfig(t, sch, model), Plan: buildPlan(t, sch, model)}, createResp)
+	if createResp.Diagnostics.HasError() {
+		t.Fatalf("Create error: %v", createResp.Diagnostics)
+	}
+
+	var created appResourceModel
+	if diags := createResp.State.Get(ctx, &created); diags.HasError() {
+		t.Fatalf("created state get: %v", diags)
+	}
+	if created.Status.ValueString() != "running" {
+		t.Errorf("status = %q, want running", created.Status.ValueString())
+	}
+	if created.ID.ValueString() != "hello" {
+		t.Errorf("id = %q, want hello", created.ID.ValueString())
+	}
+}
+
+// If GetCompose fails with a fatal (non-404) error while polling, Create must
+// fail promptly instead of retrying blindly for the full poll timeout.
+func TestAppResource_Create_FatalPollErrorFailsPromptly(t *testing.T) {
+	c := appMockFatalPollError(t)
+	// Long timeout on purpose: proves the fatal error short-circuits instead
+	// of being retried until the timeout elapses.
+	r := newAppResourceWithPoll(c, 10*time.Millisecond, 5*time.Minute)
+	sch := appSchema(t)
+	ctx := context.Background()
+	model := appCreateModel()
+
+	start := time.Now()
+	createResp := &resource.CreateResponse{State: buildState(t, sch, model)}
+	r.Create(ctx, resource.CreateRequest{Config: buildConfig(t, sch, model), Plan: buildPlan(t, sch, model)}, createResp)
+	elapsed := time.Since(start)
+
+	if !createResp.Diagnostics.HasError() {
+		t.Fatal("expected Create to fail on a fatal (non-404) poll error")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("Create took %s to fail, want a prompt failure (not retried for the full poll timeout)", elapsed)
+	}
+
+	// Even though Create fails, the install itself succeeded, so id/name
+	// should still be persisted -- otherwise this is exactly the untracked-
+	// orphan bug the polling was added to fix.
+	var created appResourceModel
+	if diags := createResp.State.Get(ctx, &created); diags.HasError() {
+		t.Fatalf("created state get: %v", diags)
+	}
+	if created.ID.ValueString() != "hello" {
+		t.Errorf("id = %q, want hello persisted so this isn't an untracked orphan", created.ID.ValueString())
+	}
+	if !created.Status.IsNull() {
+		t.Errorf("status = %q, want null (unconfirmed) on a failed poll", created.Status.ValueString())
 	}
 }
